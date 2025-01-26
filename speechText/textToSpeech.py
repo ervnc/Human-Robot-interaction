@@ -1,22 +1,25 @@
 import pyttsx3
 import threading
 
-engine = pyttsx3.init()
-voices = engine.getProperty('voices')
-engine.setProperty("rate", 180)
-engine.setProperty("voice", voices[23].id)
+class TTS:
+  def __init__(self):
+    self.engine = pyttsx3.init()
+    self.voices = self.engine.getProperty('voices')
 
-# Lock to prevent multiple threads from speaking at the same time
-tts_lock = threading.Lock()
+    self.engine.setProperty("rate", 130)
+    self.engine.setProperty("voice", self.voices[23].id)
 
-def speak(text):
-  with tts_lock:
-    engine.say(text)
-    engine.runAndWait()
+    self.tts_lock = threading.Lock()
 
-def stop_speaking():
-  with tts_lock:
-    engine.stop()
+  def speak(self, text: str):
+    with self.tts_lock:
+      self.engine.say(text)
+      self.engine.runAndWait()
+
+  def stop_speaking(self):
+    with self.tts_lock:
+      self.engine.stop()
 
 if __name__ == "__main__":
-  speak("Hello world!")
+  tts = TTS()
+  tts.speak("Antares")

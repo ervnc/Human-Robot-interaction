@@ -1,65 +1,88 @@
 from speechText import speechToText, textToSpeech
 import threading
 import time
-
-interrupt_event = threading.Event()
-
-def monitor_commands():
-  while not interrupt_event.is_set():
-    command = speechToText.speechToText(timeout=2, phrase_time_limit=2)
-    if command:
-      if command.lower() == "stop":
-        print("Stopping...")
-        interrupt_event.set()
-        break
-      elif command.lower() in ["bye", "exit"]:
-        print("Goodbye!")
-        textToSpeech.speak("Goodbye!")
-        exit()
-    time.sleep(0.1)
+import sys
+import queue
 
 def main():
   print("Initializing...")
+
+  recognized_queue = queue.Queue()
+  stop_program_event = threading.Event()
+  pause_listening_event = threading.Event()
+
+  speech_thread = speechToText.STT(
+    recognized_queue, 
+    stop_event=stop_program_event,
+    pause_listening_event=pause_listening_event
+  )
+  speech_thread.start()
+
+  tts_engine = textToSpeech.TTS()
+
+  tts_thread = None
+  conversation_active = False
+
+  def speak_in_thread(text):
+    pause_listening_event.set()
+    tts_engine.speak(text)
+    time.sleep(1)
+    pause_listening_event.clear()
+  
+  def interrupt_speaking():
+    nonlocal tts_thread
+    if tts_thread and tts_thread.is_alive():
+      tts_engine.stop_speaking()
+      tts_thread.join()  
+  
   print("Say 'hello' to start the conversation")
 
-  # Wait for the user to say "hello"
-  while True:
-    text = speechToText.speechToText(timeout=5, phrase_time_limit=5)
-    if text and text.lower() == "hello":
-      textToSpeech.speak("Hello, how can I help you?")
-      break
-    else:
-      print("Waiting for 'hello'...")
-      textToSpeech.speak("Waiting for hello")
+  try:
+    while not stop_program_event.is_set():
+      try:
+        text = recognized_queue.get(timeout=1)
+      except queue.Empty:
+        text = None
 
-  # Start monitoring for commands
-  while True:
-    text = speechToText.speechToText(timeout=5, phrase_time_limit=10)
-    if text:
-      command = text.lower()
-      if command in ["bye", "exit"]:
-        textToSpeech.speak("Goodbye")
-        print("Finishing...")
-        break
-      else:
-        response = f"You said: {text}"
+      if text:
+        lower_text = text.lower()
 
-        interrupt_event.clear()
-        thread_monitor = threading.Thread(target=monitor_commands)
-        thread_monitor.start()
+        if not conversation_active:
+          if lower_text == "hello":
+            conversation_active = True
+            interrupt_speaking()
+            print("How can I help you?")
+            tts_thread = threading.Thread(target=speak_in_thread, args=("Hello! How can I help you?",))
+            tts_thread.start()
+          else:
+            pass
+        else:
+          if lower_text == "hello":
+              print("Interrupting conversation")
+              interrupt_speaking()
+              tts_thread = threading.Thread(target=speak_in_thread, args=("Say your question again",))
+              tts_thread.start()
+          elif lower_text in ["bye", "exit"]:
+            print("Goodbye!")
+            interrupt_speaking()
+            tts_engine.speak("Goodbye!")
+            stop_program_event.set()
+            break
+          else:
+            print("You said:", text)
+            interrupt_speaking()
+            tts_thread = threading.Thread(target=speak_in_thread, args=(f"You said: {text}",))
+            tts_thread.start()
 
-        thread_speak = threading.Thread(target=textToSpeech.speak, args=(response,))
-        thread_speak.start()
-
-
-        thread_speak.join()
-
-        if interrupt_event.is_set():
-          textToSpeech.speak("Could you please repeat your question?")
-
-        thread_monitor.join()
-    else:
-      textToSpeech.speak("Please try again")
+  except KeyboardInterrupt:
+    print("Exiting")
+  finally:
+    stop_program_event.set()
+    interrupt_speaking()   
+    print("Exiting thread of speech recognition")
+    speech_thread.join(timeout=2)
+    print("Exit program")
+    sys.exit(0)
 
 if __name__ == "__main__":
   main()
