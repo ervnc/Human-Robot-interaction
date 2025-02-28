@@ -1,88 +1,164 @@
-from speechText import speechToText, textToSpeech
-import threading
+import os
 import time
-import sys
-import queue
+import numpy as np
+import tempfile
 
-def main():
-  print("Initializing...")
+from faster_whisper import WhisperModel
+import sounddevice as sd
+from scipy.io.wavfile import write
+import webrtcvad
+import collections
 
-  recognized_queue = queue.Queue()
-  stop_program_event = threading.Event()
-  pause_listening_event = threading.Event()
+import piper
 
-  speech_thread = speechToText.STT(
-    recognized_queue, 
-    stop_event=stop_program_event,
-    pause_listening_event=pause_listening_event
-  )
-  speech_thread.start()
+from langdetect import detect
 
-  tts_engine = textToSpeech.TTS()
+from ollamaLLM import LLM
+import re
 
-  tts_thread = None
-  conversation_active = False
+class WhisperTranscriber:
+  def __init__(self, model_size="small", sample_rate=16000):
+    self.model_size = model_size
+    self.sample_rate = sample_rate
+    self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
 
-  def speak_in_thread(text):
-    pause_listening_event.set()
-    tts_engine.speak(text)
-    time.sleep(1)
-    pause_listening_event.clear()
-  
-  def interrupt_speaking():
-    nonlocal tts_thread
-    if tts_thread and tts_thread.is_alive():
-      tts_engine.stop_speaking()
-      tts_thread.join()  
-  
-  print("Say 'hello' to start the conversation")
+    self.vad = webrtcvad.Vad(2)
+    
+    self.piper_en = piper.PiperVoice.load("./piperModels/en_US-bryce-medium.onnx")
+    self.piper_pt = piper.PiperVoice.load("./piperModels/pt_BR-faber-medium.onnx")
 
-  try:
-    while not stop_program_event.is_set():
-      try:
-        text = recognized_queue.get(timeout=1)
-      except queue.Empty:
-        text = None
+    self.speaking = False
 
-      if text:
-        lower_text = text.lower()
+  def detected_language(self, text):
+    try:
+      lang = detect(text)
+      return lang
+    
+    except:
+      return "en"
 
-        if not conversation_active:
-          if lower_text == "hello":
-            conversation_active = True
-            interrupt_speaking()
-            print("How can I help you?")
-            tts_thread = threading.Thread(target=speak_in_thread, args=("Hello! How can I help you?",))
-            tts_thread.start()
-          else:
-            pass
+  def speak(self, text):
+    lang = self.detected_language(text)
+
+    tts = self.piper_en if lang == "en" else self.piper_pt
+
+    self.speaking = True
+
+    stream = sd.OutputStream(
+      samplerate=tts.config.sample_rate, 
+      channels=1, 
+      dtype="int16", 
+      blocksize=2048,
+      latency=0.3)
+    
+    stream.start()
+
+    for audio_bytes in tts.synthesize_stream_raw(text):
+      if not self.speaking:
+        break
+
+      int_data = np.frombuffer(audio_bytes, dtype=np.int16)
+      stream.write(int_data)
+    
+    stream.stop()
+    stream.close()
+
+    self.speaking = False
+
+  def stop_speech(self):
+    self.stop_audio = True
+    sd.stop()
+
+  def record_audio(self, frame_duration_ms=30, padding_duration_ms=300, max_record_seconds=10):
+    while self.speaking:
+      time.sleep(0.1)
+
+    num_padding_frames = int(padding_duration_ms / frame_duration_ms)
+    ring_buffer = collections.deque(maxlen=num_padding_frames)
+    triggered = False
+    voiced_frames = []
+    frames_per_buffer = int(self.sample_rate * frame_duration_ms / 1000)
+
+    stream = sd.RawInputStream(samplerate=self.sample_rate,
+                              blocksize=frames_per_buffer,
+                              dtype='int16',
+                              channels=1)
+                              
+    start_time = time.time()
+    print("Recording...")
+
+    with stream:
+      while True:
+        if time.time() - start_time > max_record_seconds:
+          print("Max recording time reached")
+          break
+
+        frame, _ = stream.read(frames_per_buffer)
+        if len(frame) != frames_per_buffer * 2:
+          continue
+
+        is_speech = self.vad.is_speech(frame, self.sample_rate)
+
+        if not triggered:
+          ring_buffer.append((frame, is_speech))
+          num_voiced = len([f for f, speech in ring_buffer if speech])
+          if num_voiced > 0.9 * ring_buffer.maxlen:
+            triggered = True
+            print("Triggered")
+            voiced_frames.extend(f for f, _ in ring_buffer)
+            ring_buffer.clear()
         else:
-          if lower_text == "hello":
-              print("Interrupting conversation")
-              interrupt_speaking()
-              tts_thread = threading.Thread(target=speak_in_thread, args=("Say your question again",))
-              tts_thread.start()
-          elif lower_text in ["bye", "exit"]:
-            print("Goodbye!")
-            interrupt_speaking()
-            tts_engine.speak("Goodbye!")
-            stop_program_event.set()
+          voiced_frames.append(frame)
+          ring_buffer.append((frame, is_speech))
+          num_unvoiced = len([f for f, speech in ring_buffer if not speech])
+          if num_unvoiced > 0.9 * ring_buffer.maxlen:
+            print("Untriggered")
             break
-          else:
-            print("You said:", text)
-            interrupt_speaking()
-            tts_thread = threading.Thread(target=speak_in_thread, args=(f"You said: {text}",))
-            tts_thread.start()
+    
+    audio_data_bytes = b"".join(voiced_frames)
+    audio_data = np.frombuffer(audio_data_bytes, dtype=np.int16)
+    return audio_data
 
-  except KeyboardInterrupt:
-    print("Exiting")
-  finally:
-    stop_program_event.set()
-    interrupt_speaking()   
-    print("Exiting thread of speech recognition")
-    speech_thread.join(timeout=2)
-    print("Exit program")
-    sys.exit(0)
+  def save_temp_audio(self, recording):
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    write(temp_file.name, self.sample_rate, recording)
+    return temp_file.name
+
+  def transcribe_audio(self, file_path):
+    segments, info = self.model.transcribe(file_path, beam_size=5)
+    print("Detected language '%s' with probability %f" % (info.language,
+    info.language_probability))
+    os.remove(file_path)
+
+    return " ".join(seg.text for seg in segments)
+
+  def run(self):
+    self.speak("Hello")
+    while True:
+      print("Waiting for audio...")
+      recording = self.record_audio()
+      if recording is None or recording.size == 0:
+        print("No audio detected")
+        continue
+
+      file_path = self.save_temp_audio(recording)
+      transcript = self.transcribe_audio(file_path)
+
+      response_LLM = LLM(transcript)
+      print("Transcript:", transcript)
+
+      print(transcript.strip().lower())
+
+      if transcript.strip().lower() in ["bye.", "exit."]:
+        self.speak("Goodbye")
+        break
+      elif transcript.strip().lower() in ["stop.", "shut up."]:
+        self.speaking = False
+      else:
+        response_text = response_LLM.generate().response
+        clean_response = re.sub(r'<think>[\s\S]*?</think>', '', response_text).strip()
+        self.speak(clean_response)
 
 if __name__ == "__main__":
-  main()
+  transcriber = WhisperTranscriber(model_size="small", sample_rate=16000)
+  transcriber.run()
